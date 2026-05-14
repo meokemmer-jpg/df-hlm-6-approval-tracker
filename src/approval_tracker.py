@@ -11,7 +11,21 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Protocol
 
-import requests
+try:
+    import requests
+except ImportError:  # pragma: no cover - test/runtime compatibility shim
+    class _RequestException(Exception):
+        pass
+
+    class _Session:
+        def post(self, *args: Any, **kwargs: Any) -> Any:
+            raise _RequestException("requests is not installed")
+
+    class _RequestsShim:
+        RequestException = _RequestException
+        Session = _Session
+
+    requests = _RequestsShim()  # type: ignore[assignment]
 
 try:
     import structlog
@@ -35,10 +49,17 @@ except ImportError:  # pragma: no cover - tiny compatibility shim
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DARK_FACTORIES_ROOT = PROJECT_ROOT.parent
 COMMON_ROOT = DARK_FACTORIES_ROOT / "_df_common"
-if str(COMMON_ROOT) not in sys.path and COMMON_ROOT.exists():
-    sys.path.insert(0, str(COMMON_ROOT))
+for candidate in (DARK_FACTORIES_ROOT, COMMON_ROOT):
+    if str(candidate) not in sys.path and candidate.exists():
+        sys.path.insert(0, str(candidate))
 
-from atomic_lock import AtomicLock  # type: ignore[import-not-found]
+from _df_common.pii_scrubber import PIIScrubber, scrub_audit_payload  # type: ignore[import-not-found]
+from _df_common.welle_b2_patches import (  # type: ignore[import-not-found]
+    K13PreActionVerifier,
+    K16MutexGuard,
+    MOCK_PREFIX,
+    make_provenance_envelope,
+)
 from secret_vault import SecretVault, VaultError  # type: ignore[import-not-found]
 
 
@@ -151,15 +172,17 @@ class TrackerConfig:
 
 
 class JsonAuditLogger:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, pii_scrubber: PIIScrubber | None = None):
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.renderer = structlog.processors.JSONRenderer(sort_keys=True)
+        self.pii_scrubber = pii_scrubber or PIIScrubber(enabled=True, kemmer_names_enabled=True)
 
     def log(self, event: str, **fields: Any) -> None:
         entry = {"event": event, "ts": _utcnow().isoformat()}
         entry.update(fields)
-        rendered = self.renderer(None, "info", entry)
+        entry_scrubbed = scrub_audit_payload(self.pii_scrubber.scrub_dict_recursive(entry))
+        rendered = self.renderer(None, "info", entry_scrubbed)
         with self.path.open("a", encoding="utf-8") as handle:
             handle.write(rendered + "\n")
 
@@ -225,7 +248,7 @@ class MockSalesforceClient:
         self.calls += 1
         return {
             "mode": "mock",
-            "anchor_id": payload["idempotency_key"],
+            "anchor_id": f"{MOCK_PREFIX}{payload['idempotency_key']}",
             "custom_object": "Marketing-Approval-Item",
             "sf_env": "mock",
         }
@@ -234,11 +257,12 @@ class MockSalesforceClient:
 class ApprovalTracker:
     def __init__(self, config: TrackerConfig, *, salesforce_client: SalesforceClient | None = None):
         self.config = config
-        self.audit = JsonAuditLogger(config.audit_log_path)
+        self.pii_scrubber = PIIScrubber(enabled=True, kemmer_names_enabled=True)
+        self.audit = JsonAuditLogger(config.audit_log_path, pii_scrubber=self.pii_scrubber)
         self.salesforce_client = salesforce_client or (
             RealSalesforceClient(config) if config.real_salesforce_enabled else MockSalesforceClient()
         )
-        self.lock = AtomicLock(config.lock_dir / "approval-tracker.lock", ttl_s=600.0)
+        self.lock = K16MutexGuard(lock_dir=config.lock_dir, df_engine_marker="approval_tracker.py")
         self._consecutive_failures = 0
         self._circuit_open_until: datetime | None = None
 
@@ -266,12 +290,19 @@ class ApprovalTracker:
         return self.config.dlq_dir / f"{self.make_idempotency_key(item.asset_id, item.version, item.approval_round)}.json"
 
     def _build_provenance(self, item: ApprovalItem, decision: str, now: datetime) -> dict[str, Any]:
-        return {
+        provenance = make_provenance_envelope(
+            df_id="DF-HLM-6",
+            timestamp_iso=now.isoformat(),
+            is_mock=not self.config.real_salesforce_enabled,
+            activation_gate_id=self.config.phronesis_ticket if self.config.real_salesforce_enabled else None,
+        )
+        provenance.update({
             "asset_id": item.asset_id,
             "approver": item.approver or "system",
             "timestamp": now.isoformat(),
             "decision": decision,
-        }
+        })
+        return provenance
 
     def _resolve_status(self, item: ApprovalItem, now: datetime) -> tuple[str, dict[str, Any]]:
         meta: dict[str, Any] = {"ping_imke": False, "asset_modification_required": False}
@@ -310,8 +341,18 @@ class ApprovalTracker:
 
     def _write_json_atomic(self, path: Path, payload: dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
+        payload_scrubbed = self.pii_scrubber.scrub_dict_recursive(payload)
         with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, dir=str(path.parent)) as handle:
-            json.dump(payload, handle, indent=2, sort_keys=True, default=_json_default)
+            json.dump(payload_scrubbed, handle, indent=2, sort_keys=True, default=_json_default)
+            handle.flush()
+            tmp_name = handle.name
+        os.replace(tmp_name, path)
+
+    def _write_text_atomic(self, path: Path, text: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        text_scrubbed = self.pii_scrubber.scrub(text)
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, dir=str(path.parent)) as handle:
+            handle.write(text_scrubbed)
             handle.flush()
             tmp_name = handle.name
         os.replace(tmp_name, path)
@@ -329,6 +370,15 @@ class ApprovalTracker:
         self._write_json_atomic(self._dlq_file(item), payload)
 
     def _sync_payload(self, payload: dict[str, Any], now: datetime) -> dict[str, Any]:
+        if self.config.real_salesforce_enabled:
+            verifier = K13PreActionVerifier(
+                expected_env_tag="dev",
+                expected_mount_pattern="/Users/make",
+                blast_radius_class="state-only",
+            )
+            result = verifier.verify()
+            if not result.ok:
+                raise RuntimeError(f"K13-VETO: {result.failed_check}")
         if self._is_circuit_open(now):
             return {
                 "mode": "standalone_local_queue",
@@ -359,7 +409,7 @@ class ApprovalTracker:
         payload = self._build_payload(item, current_time, status)
         transport = self._sync_payload(payload, current_time) if self.config.real_salesforce_enabled else {
             "mode": "mock",
-            "anchor_id": payload["idempotency_key"],
+            "anchor_id": f"{MOCK_PREFIX}{payload['idempotency_key']}",
             "reason": "default_mock_mode",
         }
         result = {
@@ -382,7 +432,7 @@ class ApprovalTracker:
         return result
 
     def acquire_run_lock(self) -> bool:
-        return self.lock.acquire()
+        return self.lock.acquire().acquired
 
     def run(self, items: list[ApprovalItem], *, now: datetime | None = None) -> dict[str, Any]:
         current_time = now or _utcnow()
@@ -397,13 +447,27 @@ class ApprovalTracker:
                 except Exception as exc:
                     self._write_dlq(item, exc)
                     self.audit.log("item_failed", asset_id=item.asset_id, error=str(exc))
+                    if str(exc).startswith("K13-VETO"):
+                        raise
                     if self.config.failure_blast_radius != 1:
                         raise
             dashboard = self._generate_dashboard(results, current_time)
             weekly = self._generate_weekly_report(results, current_time)
             slack_updates = [entry["slack_update"] for entry in results if entry["slack_update"]]
-            self._write_json_atomic(self.config.report_dir / "slack-updates.json", {"updates": slack_updates})
-            self.audit.log("run_end", processed=len(results))
+            run_provenance = make_provenance_envelope(
+                df_id="DF-HLM-6",
+                timestamp_iso=current_time.isoformat(),
+                is_mock=not self.config.real_salesforce_enabled,
+                activation_gate_id=self.config.phronesis_ticket if self.config.real_salesforce_enabled else None,
+            )
+            self._write_json_atomic(
+                self.config.report_dir / "slack-updates.json",
+                {"provenance": run_provenance, "updates": slack_updates},
+            )
+            self.audit.log(
+                "run_complete" if self.config.real_salesforce_enabled else "mock_run_complete",
+                processed=len(results),
+            )
             return {
                 "results": results,
                 "daily_dashboard": str(dashboard),
@@ -421,22 +485,35 @@ class ApprovalTracker:
         html = (
             "<html><body><h1>DF-HLM-6 Daily Status Dashboard</h1>"
             f"<p>Generated: {now.isoformat()}</p>"
+            f"<p>Provenance mode: {'real-api' if self.config.real_salesforce_enabled else 'mock'}</p>"
             "<table><tr><th>Asset</th><th>Status</th><th>Decision</th></tr>"
             f"{rows}</table></body></html>"
         )
         path = self.config.report_dir / "daily-status-dashboard.html"
-        path.write_text(html, encoding="utf-8")
+        self._write_text_atomic(path, html)
         return path
 
     def _generate_weekly_report(self, results: list[dict[str, Any]], now: datetime) -> Path:
         counts: dict[str, int] = {}
         for entry in results:
             counts[entry["workflow_status"]] = counts.get(entry["workflow_status"], 0) + 1
-        lines = ["# DF-HLM-6 Weekly Report", f"- Generated: {now.isoformat()}"]
+        provenance = make_provenance_envelope(
+            df_id="DF-HLM-6",
+            timestamp_iso=now.isoformat(),
+            is_mock=not self.config.real_salesforce_enabled,
+            activation_gate_id=self.config.phronesis_ticket if self.config.real_salesforce_enabled else None,
+        )
+        lines = [
+            "---",
+            json.dumps({"provenance": provenance}, sort_keys=True),
+            "---",
+            "# DF-HLM-6 Weekly Report",
+            f"- Generated: {now.isoformat()}",
+        ]
         for key in sorted(counts):
             lines.append(f"- {key}: {counts[key]}")
         path = self.config.report_dir / "weekly-report.md"
-        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        self._write_text_atomic(path, "\n".join(lines) + "\n")
         return path
 
 

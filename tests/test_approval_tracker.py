@@ -57,6 +57,11 @@ def build_tracker(
     return ApprovalTracker(config, salesforce_client=client)
 
 
+@pytest.fixture
+def engine(tmp_path: Path) -> ApprovalTracker:
+    return build_tracker(tmp_path)
+
+
 def make_item(**overrides: object) -> ApprovalItem:
     base = {
         "asset_id": "asset-001",
@@ -276,3 +281,63 @@ def test_audit_log_appended_per_run(tmp_path: Path) -> None:
     lines = tracker.config.audit_log_path.read_text(encoding="utf-8").strip().splitlines()
     assert len(lines) >= 4
     assert all(json.loads(line)["event"] for line in lines)
+
+
+def test_pii_scrubbed_in_output_with_kemmer_name(engine: ApprovalTracker) -> None:
+    """Output enthaelt keinen Kemmer-Familien-Namen."""
+    engine.run([make_item(asset_id="asset-martin", approver="Martin", decision="approved")])
+
+    output_text = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (
+            engine.config.report_dir / "daily-status-dashboard.html",
+            engine.config.report_dir / "weekly-report.md",
+            engine.config.report_dir / "slack-updates.json",
+            *engine.config.queue_dir.glob("*.json"),
+            engine.config.audit_log_path,
+        )
+    )
+    assert "Martin" not in output_text
+    assert "Imke" not in output_text
+
+
+def test_k13_pre_action_verification_env_tag_block(
+    engine: ApprovalTracker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real-Mode mit falschem env_tag wird geblockt."""
+    monkeypatch.setenv("DF_ENV_TAG", "prod")
+    monkeypatch.setenv("DF_HLM_6_REAL_SALESFORCE_ENABLED", "true")
+    engine.config.real_salesforce_enabled = True
+    engine.config.sf_env = "sandbox"
+    engine.config.phronesis_ticket = "PT-2026-05-001"
+
+    with pytest.raises(RuntimeError) as exc_info:
+        engine.run([make_item(asset_id="asset-k13")])
+
+    assert "K13" in str(exc_info.value)
+
+
+def test_mock_provenance_explicit_in_output(engine: ApprovalTracker) -> None:
+    """Mock-Outputs haben 'mode': 'mock' in Provenance."""
+    result = engine.run([make_item(asset_id="asset-mock-provenance")])
+
+    weekly_report = Path(result["weekly_report"]).read_text(encoding="utf-8")
+    slack_updates = json.loads((engine.config.report_dir / "slack-updates.json").read_text(encoding="utf-8"))
+    assert '"mode": "mock"' in weekly_report
+    assert slack_updates["provenance"]["mode"] == "mock"
+    assert result["results"][0]["salesforce"]["anchor_id"].startswith("MOCK-")
+
+
+def test_k16_mutex_blocks_concurrent_spawn(tmp_path: Path, engine: ApprovalTracker) -> None:
+    """Concurrent Engine-Spawn wird geblockt."""
+    tracker_b = build_tracker(tmp_path)
+    assert engine.acquire_run_lock() is True
+
+    try:
+        with pytest.raises(ConcurrentRunError) as exc_info:
+            tracker_b.run([make_item(asset_id="asset-k16")])
+    finally:
+        engine.lock.release()
+
+    assert "K16" in str(exc_info.value)

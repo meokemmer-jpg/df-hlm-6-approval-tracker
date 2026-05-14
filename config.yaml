@@ -1,0 +1,107 @@
+# DF-HLM-6 Approval-Tracker Configuration [CRUX-MK]
+df_id: DF-HLM-6
+df_name: heylou-marketing-wave-2-approval-tracker
+version: 0.1.0
+status: ACTIVE-SKELETON
+description: >
+  Approval tracker for HeyLou Marketing Wave 2. It synchronizes approval items to
+  Salesforce Marketing Cloud, enforces Imke/Martin escalation rules, and keeps a
+  local queue for degraded operation and manual reconciliation.
+
+workflow:
+  custom_object: Marketing-Approval-Item
+  sources:
+    - df-hlm-1-asset-pipeline
+    - df-hlm-3-konkurrenz-alerts
+    - manual-imke-tickets
+  source_filter:
+    asset_status: PENDING-IMKE-APPROVAL
+  statuses:
+    - pending
+    - in-review
+    - approved
+    - rejected
+    - escalated-to-martin
+  auto_escalation:
+    pending_after_hours: 72
+    in_review_ping_after_hours: 48
+  rejection_follow_up:
+    target: df-hlm-1-asset-modification
+  idempotency_key: hash(asset_id + version + approval_round)
+
+salesforce:
+  api_type: rest_oauth2
+  custom_object: Marketing-Approval-Item
+  external_anchor_type: salesforce_api
+  auth:
+    token_source: secret_vault
+    env_gate:
+      real_mode_var: DF_HLM_6_REAL_SALESFORCE_ENABLED
+      sf_env_var: SF_ENV
+      phronesis_ticket_var: PHRONESIS_TICKET
+  allowed_envs:
+    - sandbox
+    - production
+  default_mode: mock
+
+K11_cascade_isolation:
+  failure_blast_radius: 1
+  dependency_dlq_separate: true
+
+K12_distillation_resistance:
+  provenance_required_in_output: true
+  non_llm_validation_layer: true
+
+K13_external_anchor:
+  external_anchor_type: salesforce_api
+  pre_action_domain_check: true
+
+K14_human_override:
+  override_complexity: single_command
+  martin_review_cadence: weekly
+
+K15_entropy_budget:
+  entropy_added_loc_estimate: 350
+  entropy_justified_by_rho: EUR 45-60k/Jahr Approval-Velocity
+
+K16_concurrent_spawn:
+  lock_dir: /tmp/df-hlm-6.lock
+  engine_pgrep_check: true
+
+LC1_graceful_degradation:
+  modes:
+    - full
+    - degraded_salesforce_api
+    - degraded_slack_api
+    - standalone_local_queue
+
+LC2_direct_mode:
+  capability: 0.50
+  trigger: Salesforce-API unreachable >30s
+
+LC3_circuit_breaker:
+  timeout_s: 30
+  open_threshold: 3
+  rate_limit_backoff_s: 60
+
+LC4_failure_isolation:
+  state_externalization: true
+  idempotent: true
+
+LC5_health_check:
+  health_check_dependencies: []
+
+env_var_gating:
+  default_disabled: true
+  mock_mode_behavior: approval_status_dict_from_local_queue
+  required_for_real_mode:
+    DF_HLM_6_REAL_SALESFORCE_ENABLED: "true"
+    SF_ENV: sandbox|production
+    PHRONESIS_TICKET: PT-2026-XX-XXX
+
+outputs:
+  dashboard_html: runtime/reports/daily-status-dashboard.html
+  weekly_report_markdown: runtime/reports/weekly-report.md
+  slack_updates: runtime/reports/slack-updates.json
+  local_queue_root: runtime/local_queue
+  audit_log: runtime/audit.jsonl

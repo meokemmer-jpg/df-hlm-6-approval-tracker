@@ -1,10 +1,10 @@
 {
   "df": "df-hlm-6-approval-tracker",
-  "ts": "2026-09-29T06:25:28.351379+00:00",
+  "ts": "2026-09-30T06:27:07.404286+00:00",
   "maturity": "CODE",
   "maturity_level": 3,
   "evidence_grade": 2,
   "grade_basis": "pytest-gruen (LLM-selbstgeschrieben), codex_verify=UNKNOWN -> max Grade-2 (CODE), nie TESTED/4",
-  "wargame_verdict": null,
+  "wargame_verdict": "CONDITIONAL",
   "crux": "[CRUX-MK]"
 }
